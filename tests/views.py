@@ -1,11 +1,14 @@
 """Test views for django-rest-framework-mcp."""
 
-from rest_framework import viewsets
+from django_filters import rest_framework as django_filters
+from rest_framework import mixins, viewsets
 from rest_framework.authentication import (
     BasicAuthentication,
     SessionAuthentication,
     TokenAuthentication,
 )
+from rest_framework.filters import OrderingFilter
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
 
@@ -109,3 +112,66 @@ class CustomPermissionViewSet(viewsets.GenericViewSet):
 
     def list(self, request):
         return Response([{"id": 1, "name": "Should never reach here"}])
+
+
+# ---------------------------------------------------------------------------
+# Fixtures for list filtering/ordering/pagination and view hooks. These are
+# registered manually (not decorated) by the tests that use them.
+# ---------------------------------------------------------------------------
+
+
+class CustomerFilterSet(django_filters.FilterSet):
+    """FilterSet exercising a boolean filter and a numeric (renamed) filter."""
+
+    is_active = django_filters.BooleanFilter()
+    min_age = django_filters.NumberFilter(field_name="age", lookup_expr="gte")
+
+    class Meta:
+        model = Customer
+        fields = ["is_active", "min_age"]
+
+
+class SmallPagePagination(PageNumberPagination):
+    """Tiny page size so pagination is observable with only a couple of rows."""
+
+    page_size = 2
+    page_size_query_param = "page_size"
+
+
+class FilterableCustomerViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
+    """Customers with filtering, ordering and pagination enabled."""
+
+    queryset = Customer.objects.all().order_by("id")
+    serializer_class = CustomerSerializer
+    filter_backends = [django_filters.DjangoFilterBackend, OrderingFilter]
+    filterset_class = CustomerFilterSet
+    ordering_fields = ["age", "name"]
+    pagination_class = SmallPagePagination
+
+
+class FilterFieldsCustomerViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
+    """Uses ``filterset_fields`` (auto-generated FilterSet) instead of a ``filterset_class``."""
+
+    queryset = Customer.objects.all()
+    serializer_class = CustomerSerializer
+    filter_backends = [django_filters.DjangoFilterBackend]
+    filterset_fields = ["is_active", "age"]
+
+
+class PlainCustomerViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
+    """Customers with no filtering, ordering or pagination configured."""
+
+    queryset = Customer.objects.all()
+    serializer_class = CustomerSerializer
+
+
+class EchoViewSet(viewsets.GenericViewSet):
+    """Echoes back context attached to the request by an MCPView hook."""
+
+    def list(self, request, *args, **kwargs):
+        return Response(
+            {
+                "injected": getattr(request, "injected", None),
+                "from_params": getattr(request, "from_params", None),
+            }
+        )

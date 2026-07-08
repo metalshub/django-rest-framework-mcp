@@ -45,6 +45,7 @@ setup(
             "django-stubs>=4.0.0",
             "djangorestframework-stubs>=3.14.0",
             "factory-boy>=3.3.0",
+            "django-filter>=23.0",
         ],
         "test": [
             "pytest>=7.0.0",
@@ -52,6 +53,7 @@ setup(
             "pytest-cov>=4.0.0",
             "coverage>=6.0",
             "factory-boy>=3.3.0",
+            "django-filter>=23.0",
         ],
     },
 )

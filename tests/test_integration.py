@@ -3,7 +3,7 @@
 import base64
 import json
 
-from django.test import TestCase, override_settings
+from django.test import RequestFactory, TestCase, override_settings
 from rest_framework import mixins, serializers, viewsets
 from rest_framework.authentication import (
     TokenAuthentication,
@@ -15,6 +15,7 @@ from rest_framework.response import Response
 from djangorestframework_mcp.decorators import mcp_tool, mcp_viewset
 from djangorestframework_mcp.registry import registry
 from djangorestframework_mcp.test import MCPClient
+from djangorestframework_mcp.views import MCPView
 
 from .factories import (
     CategoryFactory,
@@ -26,10 +27,13 @@ from .factories import (
     UserFactory,
 )
 from .models import Category, Customer, Order, Product, Tag
+from .serializers import CustomerSerializer
 from .views import (
     AuthenticatedViewSet,
     CustomAuthViewSet,
     CustomPermissionViewSet,
+    EchoViewSet,
+    FilterableCustomerViewSet,
     MultipleAuthViewSet,
     UnauthenticatedViewSet,
 )
@@ -2828,3 +2832,222 @@ class TestDurationFieldIntegration(MCPTestCase):
         self.assertIn("duration", required)
         self.assertIn("min_duration", required)
         self.assertNotIn("optional_duration", required)
+
+
+@override_settings(ROOT_URLCONF="tests.urls")
+class ListQueryExecutionTests(TestCase):
+    """End-to-end: an MCP ``query`` is applied through the ViewSet's filter backends."""
+
+    def setUp(self):
+        registry.clear()
+        registry.register_viewset(
+            FilterableCustomerViewSet, base_name="filterablecustomer"
+        )
+        self.client = MCPClient()
+
+    def tearDown(self):
+        registry.clear()
+
+    def _results(self, result):
+        return result["structuredContent"]["results"]
+
+    def test_tools_list_advertises_query(self):
+        tools = {t["name"]: t for t in self.client.list_tools()["tools"]}
+
+        query = tools["list_filterablecustomer"]["inputSchema"]["properties"]["query"]
+        self.assertIn("ordering", query["properties"])
+        self.assertIn("is_active", query["properties"])
+        self.assertIn("page", query["properties"])
+
+    def test_ordering_applied(self):
+        CustomerFactory(name="Young", age=20)
+        CustomerFactory(name="Old", age=70)
+
+        result = self.client.call_tool(
+            "list_filterablecustomer", {"query": {"ordering": "-age"}}
+        )
+
+        self.assertFalse(result.get("isError"), result)
+        ages = [row["age"] for row in self._results(result)]
+        self.assertEqual(ages, sorted(ages, reverse=True))
+
+    def test_boolean_filter_applied(self):
+        active = CustomerFactory(is_active=True)
+        inactive = CustomerFactory(is_active=False)
+
+        result = self.client.call_tool(
+            "list_filterablecustomer", {"query": {"is_active": True}}
+        )
+
+        self.assertFalse(result.get("isError"), result)
+        ids = {row["id"] for row in self._results(result)}
+        self.assertIn(active.id, ids)
+        self.assertNotIn(inactive.id, ids)
+
+    def test_number_filter_applied(self):
+        young = CustomerFactory(age=20)
+        old = CustomerFactory(age=70)
+
+        result = self.client.call_tool(
+            "list_filterablecustomer", {"query": {"min_age": 65}}
+        )
+
+        self.assertFalse(result.get("isError"), result)
+        ids = {row["id"] for row in self._results(result)}
+        self.assertIn(old.id, ids)
+        self.assertNotIn(young.id, ids)
+
+    def test_pagination_applied(self):
+        CustomerFactory.create_batch(5)
+
+        result = self.client.call_tool(
+            "list_filterablecustomer", {"query": {"page": 1, "page_size": 2}}
+        )
+
+        self.assertFalse(result.get("isError"), result)
+        self.assertEqual(len(self._results(result)), 2)
+        self.assertEqual(result["structuredContent"]["count"], 5)
+
+    def test_no_query_runs_backends_with_defaults(self):
+        CustomerFactory.create_batch(3)
+
+        result = self.client.call_tool("list_filterablecustomer")
+
+        self.assertFalse(result.get("isError"), result)
+        # Backends still run without a query: full (unfiltered) count, default first page.
+        self.assertEqual(result["structuredContent"]["count"], 3)
+
+
+@override_settings(ROOT_URLCONF="tests.urls")
+class ToolMetadataDiscoveryTests(TestCase):
+    """End-to-end: docstring descriptions, annotations, and resilient discovery over tools/list."""
+
+    def tearDown(self):
+        registry.clear()
+
+    def _tools(self):
+        return {t["name"]: t for t in MCPClient().list_tools()["tools"]}
+
+    def test_description_from_docstring_and_read_only_annotation(self):
+        registry.clear()
+
+        class DocumentedViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
+            """Return the current company's own listings, not the public feed."""
+
+            queryset = Customer.objects.all()
+            serializer_class = CustomerSerializer
+
+        registry.register_viewset(DocumentedViewSet, base_name="documented")
+        tool = self._tools()["list_documented"]
+
+        self.assertEqual(
+            tool["description"],
+            "Return the current company's own listings, not the public feed.",
+        )
+        self.assertTrue(tool["annotations"]["readOnlyHint"])
+
+    def test_unschemable_tool_is_skipped_not_fatal(self):
+        registry.clear()
+
+        class UnsupportedField(serializers.Field):
+            def to_representation(self, value):
+                return value
+
+            def to_internal_value(self, data):
+                return data
+
+        class UnschemableSerializer(serializers.Serializer):
+            weird = UnsupportedField()
+
+        class GoodViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
+            queryset = Customer.objects.all()
+            serializer_class = CustomerSerializer
+
+        class BadViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
+            queryset = Customer.objects.all()
+            serializer_class = UnschemableSerializer
+
+        registry.register_viewset(GoodViewSet, base_name="good")
+        registry.register_viewset(BadViewSet, base_name="bad")
+
+        names = {t["name"] for t in MCPClient().list_tools()["tools"]}
+
+        self.assertIn("list_good", names)
+        self.assertNotIn("create_bad", names)
+
+
+class MCPViewHookTests(TestCase):
+    """The prepare_tool_request and on_viewset_permission_denied MCPView hooks."""
+
+    def _call_tool(self, view_cls, tool_name, arguments=None):
+        factory = RequestFactory()
+        request = factory.post(
+            "/mcp/",
+            data=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {"name": tool_name, "arguments": arguments or {}},
+                    "id": 1,
+                }
+            ),
+            content_type="application/json",
+        )
+        response = view_cls.as_view()(request)
+        return response, json.loads(response.content)
+
+    def tearDown(self):
+        registry.clear()
+
+    def test_prepare_tool_request_injects_context(self):
+        registry.clear()
+        registry.register_viewset(EchoViewSet, base_name="echo")
+
+        class InjectingMCPView(MCPView):
+            def prepare_tool_request(self, request, original_request, tool, params):
+                request.injected = "yes"
+                request.from_params = params.get("body", {}).get("marker")
+
+        response, data = self._call_tool(
+            InjectingMCPView, "list_echo", {"body": {"marker": "hello"}}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["result"]["structuredContent"]["injected"], "yes")
+        self.assertEqual(data["result"]["structuredContent"]["from_params"], "hello")
+
+    def test_default_prepare_tool_request_is_noop(self):
+        registry.clear()
+        registry.register_viewset(EchoViewSet, base_name="echo")
+
+        response, data = self._call_tool(MCPView, "list_echo")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(data["result"]["structuredContent"]["injected"])
+
+    def test_permission_denial_default_is_http_403(self):
+        registry.clear()
+        registry.register_viewset(CustomPermissionViewSet)
+
+        response, data = self._call_tool(MCPView, "list_custompermission")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(data["result"]["isError"])
+
+    def test_permission_denial_hook_converts_to_tool_error(self):
+        registry.clear()
+        registry.register_viewset(CustomPermissionViewSet)
+
+        class ToolErrorMCPView(MCPView):
+            def on_viewset_permission_denied(self, tool, exc, request):
+                raise ValueError(f"handled: {exc.detail}")
+
+        response, data = self._call_tool(ToolErrorMCPView, "list_custompermission")
+
+        # No 403: the connection is fine, only this specific call was denied.
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.has_header("WWW-Authenticate"))
+        self.assertTrue(data["result"]["isError"])
+        self.assertIn(
+            "handled: Custom permission denied", data["result"]["content"][0]["text"]
+        )

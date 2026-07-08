@@ -62,6 +62,7 @@ class MCPRegistry:
                 if custom_title
                 else self._generate_tool_title(action_name, base_name)
             )
+            description_is_auto = not custom_description
             description = (
                 custom_description
                 if custom_description
@@ -75,6 +76,7 @@ class MCPRegistry:
                 action=action_name,
                 title=title,
                 description=description,
+                description_is_auto=description_is_auto,
             )
 
             # Set input_serializer if it was explicitly provided
@@ -126,9 +128,9 @@ class MCPRegistry:
 
         # Custom @action decorated methods are only registered if they have @mcp_tool decoration
         extra_actions = viewset_class.get_extra_actions()
-        for action in extra_actions:
-            if hasattr(action, "_mcp_needs_registration"):
-                actions.append(action.__name__)
+        for extra_action in extra_actions:
+            if hasattr(extra_action, "_mcp_needs_registration"):
+                actions.append(extra_action.__name__)
 
         return actions
 

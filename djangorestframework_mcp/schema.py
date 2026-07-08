@@ -6,6 +6,7 @@ from rest_framework import serializers
 from rest_framework.fields import Field
 from rest_framework.utils.field_mapping import ClassLookupDict
 
+from .filtering import build_list_query_schema
 from .types import MCPTool
 
 
@@ -248,7 +249,7 @@ def get_primary_key_related_field_schema(
 ) -> Dict[str, Any]:
     """Generate schema for PrimaryKeyRelatedField."""
     # Get the model from queryset
-    model = field.get_queryset().model
+    model = field.get_queryset().model  # type: ignore[union-attr]
 
     # Get the actual field being referenced
     related_obj_field = model._meta.pk
@@ -277,7 +278,7 @@ def get_slug_related_field_schema(
 ) -> Dict[str, Any]:
     """Generate schema for SlugRelatedField."""
     # Get the model from queryset
-    model = field.get_queryset().model
+    model = field.get_queryset().model  # type: ignore[union-attr]
 
     # Get the actual field being referenced
     related_obj_field_name = field.slug_field
@@ -313,7 +314,7 @@ def get_hyperlinked_related_field_schema(
         description_parts.append(f"to {field.view_name}")
 
     try:
-        model_name = field.get_queryset().model._meta.verbose_name
+        model_name = field.get_queryset().model._meta.verbose_name  # type: ignore[union-attr]
         description_parts.insert(-1, f"for {model_name}")
     except Exception:
         pass
@@ -672,6 +673,14 @@ def generate_tool_schema(tool: MCPTool) -> Dict[str, Any]:
         properties["body"] = body_info["schema"]
         if body_info["is_required"]:
             required.append("body")
+
+    # Add an optional `query` object for list tools, mirroring the query string the same endpoint
+    # accepts over HTTP (ordering, filterset fields, pagination). Only advertised when the ViewSet
+    # actually exposes something to narrow by; never required.
+    if tool.action == "list":
+        query_schema = build_list_query_schema(tool.viewset_class)
+        if query_schema:
+            properties["query"] = query_schema
 
     # Build final schema
     schema = {

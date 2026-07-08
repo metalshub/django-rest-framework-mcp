@@ -429,6 +429,55 @@ class CustomerViewSet(viewsets.ModelViewSet):
       # ... request.data will be an array of Posts
 ```
 
+### List Filtering, Ordering & Pagination
+
+A regular DRF `list` endpoint is narrowed with a query string (`?ordering=`, filterset fields, `?page=`). MCP tool calls don't carry a query string, so for `list` tools the library advertises an optional `query` object on the tool's input schema, derived from the ViewSet's own configuration. When present, it is applied through the ViewSet's real filter backends, so filtering, ordering and pagination behave exactly as they do over HTTP.
+
+```python
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.filters import OrderingFilter
+from rest_framework.pagination import PageNumberPagination
+
+@mcp_viewset()
+class PostViewSet(viewsets.ModelViewSet):
+    queryset = Post.objects.all()
+    serializer_class = PostSerializer
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_fields = ["category", "author"]   # or a filterset_class
+    ordering_fields = ["created_at", "title"]
+    pagination_class = PageNumberPagination
+```
+
+The `list_post` tool now accepts, for example:
+
+```json
+{ "query": { "category": "programming", "ordering": "-created_at", "page": 1, "page_size": 5 } }
+```
+
+Notes:
+
+- **Ordering** is advertised only when `OrderingFilter` is in `filter_backends` and `ordering_fields` is a concrete list (not `"__all__"`). Each field is offered in ascending and `-`-prefixed descending form.
+- **Filters** are advertised only when `DjangoFilterBackend` is active and the ViewSet declares a `filterset_class` or `filterset_fields`. `django-filter` is an optional dependency — if it isn't installed, filter fields simply aren't advertised (ordering and pagination still are).
+- **Pagination** adds `page` / `page_size` whenever the ViewSet has a `pagination_class`.
+- Without a `query`, the ViewSet's backends still run with their defaults (first page, default ordering) — identical to a `GET` with no query string.
+
+### Tool Descriptions and Annotations
+
+Every tool in `tools/list` is given a description and MCP [`annotations`](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#tool):
+
+- **Description:** an explicit `@mcp_tool(description=...)` always wins. Otherwise, if the ViewSet has a docstring, its first paragraph is used (this reads far better for an LLM than the generated `"List post"` default and lets two ViewSets over the same model be told apart). Otherwise the generated default is used.
+- **Annotations:** `readOnlyHint` is set for `list`/`retrieve` (so clients such as Claude's connector UI can bucket read-only tools), and write actions additionally advertise `destructiveHint` (true for `destroy`) and `idempotentHint` (true for `update`/`partial_update`/`destroy`). `openWorldHint` is `False`. Override `get_tool_annotations` on your `MCPView` to customize.
+
+If schema generation fails for a single tool (e.g. a serializer field the library can't yet introspect), that tool is logged and skipped rather than breaking `tools/list` for the whole server.
+
+### Customizing Tool Execution and Discovery
+
+`MCPView` exposes hooks for host applications that need to bridge context a router/middleware would normally provide, or to control how a per-call authorization failure is surfaced. Subclass `MCPView` (see [Defining Authentication and Permissions on the MCP Endpoint](#defining-authentication-and-permissions-on-the-mcp-endpoint)) and override:
+
+- **`prepare_tool_request(self, request, original_request, tool, params)`** — called after the per-tool DRF request is built but _before_ the ViewSet's permission classes run. Attach state your ViewSets expect (for example, multi-tenant context resolved from `params`). Raising here aborts the call as a tool error. Default: no-op.
+- **`on_viewset_permission_denied(self, tool, exc, request)`** — called when a ViewSet's permission classes deny a `tools/call`. By default it re-raises, surfacing an HTTP 403. Override it to raise a plain exception instead, which is reported as a tool-level error (`isError`) over HTTP 200 — useful when a 403 would wrongly prompt an MCP client to re-authenticate the whole connection.
+- **`build_tool_definition(self, tool)`** — returns the `tools/list` entry for a tool (or `None` to skip it). Call `super().build_tool_definition(tool)` and extend the returned `inputSchema` to advertise extra inputs of your own.
+
 ## Testing Your MCP Tools
 
 The library provides test utilities to verify your MCP tools work correctly:
@@ -487,6 +536,11 @@ class CustomerMCPTests(TestCase):
   - ✅ Related fields (PKRelated/SlugRelated/HyperlinkedRelated/ManyRelated)
   - ✅ Nested Serializers
   - ✅ ListSerializers
+- ✅ Tool descriptions from ViewSet docstrings and MCP `annotations` (readOnly/destructive/idempotent hints)
+- ✅ List `query` input for filtering/ordering/pagination
+  - ✅ Filtering via DjangoFilterBackend (`filterset_fields` / `filterset_class`)
+  - ✅ OrderingFilter support (`ordering_fields`)
+  - ✅ Pagination (`page` / `page_size`)
 - ✅ Test utilities for MCP tools
 - ✅ Authentication
 
@@ -506,13 +560,7 @@ class CustomerMCPTests(TestCase):
 
 - Basic OpenAPI schema export for MCP tools
 
-- Filtering via DjangoFilterBackend (filterset_fields/class)
-
 - SearchFilter support (search_fields)
-
-- OrderingFilter support (ordering_fields)
-
-- Pagination (LimitOffsetPagination/PageNumberPagination/CursorPagination)
 
 - Throttling (UserRateThrottle/AnonRateThrottle/ScopedRateThrottle)
 
@@ -569,6 +617,10 @@ The main MCP HTTP endpoint handler that processes JSON-RPC requests and routes t
 **Methods:**
 
 - `has_mcp_permission(self, request: HttpRequest) -> bool`: Override this method to implement custom permission logic for the MCP endpoint. Called after authentication, so `request.user` and `request.auth` are available. Default behavior returns True (allows all requests).
+- `prepare_tool_request(self, request, original_request, tool, params) -> None`: Hook called during `tools/call`, after the per-tool DRF request is built but before the ViewSet's permission classes run. Override to attach per-call context (e.g. multi-tenancy) to `request`. Raising aborts the call as a tool error. Default: no-op.
+- `on_viewset_permission_denied(self, tool, exc, request) -> None`: Hook called when a ViewSet's permission classes deny a `tools/call`. Default re-raises (HTTP 403). Override to raise a plain exception instead, surfacing the denial as a tool-level error (`isError`) over HTTP 200.
+- `build_tool_definition(self, tool) -> Optional[dict]`: Builds the `tools/list` entry for a tool, or returns `None` to skip it (also skipped automatically if its input schema can't be generated). Override to extend the entry, e.g. add inputs to its `inputSchema`.
+- `get_tool_description(self, tool) -> Optional[str]` / `get_tool_annotations(self, tool) -> dict`: Override to customize the description and MCP annotations advertised for each tool.
 
 ### Settings
 

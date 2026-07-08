@@ -379,6 +379,40 @@ class TestGenerateToolSchema(unittest.TestCase):
         self.assertEqual(input_schema["properties"], {})
         self.assertEqual(input_schema["required"], [])
 
+    def test_list_action_schema_includes_query_when_filterable(self):
+        """A list ViewSet with ordering/pagination gets an optional `query` object."""
+        from rest_framework.filters import OrderingFilter
+        from rest_framework.pagination import PageNumberPagination
+
+        class FilterableViewSet(ModelViewSet):
+            serializer_class = self.MockSerializer
+            filter_backends = [OrderingFilter]
+            ordering_fields = ["name"]
+            pagination_class = PageNumberPagination
+
+        tool = MCPTool(name="list_test", viewset_class=FilterableViewSet, action="list")
+        schema = generate_tool_schema(tool)
+
+        query = schema["inputSchema"]["properties"]["query"]
+        assert set(query["properties"]["ordering"]["enum"]) == {"name", "-name"}
+        assert "page" in query["properties"]
+
+    def test_query_only_added_for_list_action(self):
+        """The `query` object is a list-only concept; detail actions never get one."""
+        from rest_framework.filters import OrderingFilter
+
+        class FilterableViewSet(ModelViewSet):
+            serializer_class = self.MockSerializer
+            filter_backends = [OrderingFilter]
+            ordering_fields = ["name"]
+
+        tool = MCPTool(
+            name="retrieve_test", viewset_class=FilterableViewSet, action="retrieve"
+        )
+        schema = generate_tool_schema(tool)
+
+        assert "query" not in schema["inputSchema"]["properties"]
+
     def test_retrieve_action_schema(self):
         """Test schema generation for retrieve action."""
         tool = MCPTool(

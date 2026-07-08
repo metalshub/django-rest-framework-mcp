@@ -11,12 +11,139 @@ from rest_framework.authentication import (
     SessionAuthentication,
     TokenAuthentication,
 )
+from rest_framework.viewsets import GenericViewSet
 
 from djangorestframework_mcp.registry import registry
 from djangorestframework_mcp.types import MCPTool
 from djangorestframework_mcp.views import MCPView
 from tests.factories import TokenFactory, UserFactory
 from tests.views import AuthenticatedViewSet, MultipleAuthViewSet
+
+
+class _Dummy(GenericViewSet):
+    """A dummy ViewSet for building MCPTool objects in metadata unit tests."""
+
+
+def _tool(action, *, viewset_class=_Dummy, description="Auto", is_auto=True):
+    return MCPTool(
+        name=f"{action}_thing",
+        viewset_class=viewset_class,
+        action=action,
+        description=description,
+        description_is_auto=is_auto,
+    )
+
+
+class ToolDescriptionUnitTests(TestCase):
+    """MCPView.get_tool_description: explicit > own docstring > generated default."""
+
+    def test_uses_own_docstring_summary_when_auto(self):
+        class Documented(GenericViewSet):
+            """First paragraph is the summary.
+
+            Second paragraph must be ignored.
+            """
+
+        description = MCPView().get_tool_description(
+            _tool("list", viewset_class=Documented)
+        )
+        assert description == "First paragraph is the summary."
+
+    def test_ignores_docstring_inherited_from_mixins(self):
+        # GenericViewSet subclasses inherit docstrings via the MRO; we must not surface those.
+        class Undocumented(GenericViewSet):
+            pass
+
+        description = MCPView().get_tool_description(
+            _tool("list", viewset_class=Undocumented, description="List thing")
+        )
+        assert description == "List thing"
+
+    def test_explicit_description_is_not_overridden_by_docstring(self):
+        class Documented(GenericViewSet):
+            """This should be ignored for an explicit description."""
+
+        description = MCPView().get_tool_description(
+            _tool(
+                "list",
+                viewset_class=Documented,
+                description="Explicit",
+                is_auto=False,
+            )
+        )
+        assert description == "Explicit"
+
+
+class ToolAnnotationsUnitTests(TestCase):
+    """MCPView.get_tool_annotations derives hints from the action."""
+
+    def test_list_and_retrieve_are_read_only(self):
+        view = MCPView()
+        assert view.get_tool_annotations(_tool("list")) == {
+            "readOnlyHint": True,
+            "openWorldHint": False,
+        }
+        assert view.get_tool_annotations(_tool("retrieve"))["readOnlyHint"] is True
+
+    def test_create_is_writable_non_destructive_non_idempotent(self):
+        annotations = MCPView().get_tool_annotations(_tool("create"))
+        assert annotations["readOnlyHint"] is False
+        assert annotations["destructiveHint"] is False
+        assert annotations["idempotentHint"] is False
+
+    def test_destroy_is_destructive_and_idempotent(self):
+        annotations = MCPView().get_tool_annotations(_tool("destroy"))
+        assert annotations["destructiveHint"] is True
+        assert annotations["idempotentHint"] is True
+
+    def test_update_is_idempotent_but_not_destructive(self):
+        annotations = MCPView().get_tool_annotations(_tool("partial_update"))
+        assert annotations["idempotentHint"] is True
+        assert annotations["destructiveHint"] is False
+
+
+class BuildToolDefinitionUnitTests(TestCase):
+    """MCPView.build_tool_definition / handle_tools_list resilience to schema failures."""
+
+    def test_returns_none_when_schema_generation_fails(self):
+        with patch(
+            "djangorestframework_mcp.views.generate_tool_schema",
+            side_effect=ValueError("boom"),
+        ):
+            assert MCPView().build_tool_definition(_tool("list")) is None
+
+    def test_includes_annotations_and_description(self):
+        schema = {"inputSchema": {"type": "object", "properties": {}, "required": []}}
+        with patch(
+            "djangorestframework_mcp.views.generate_tool_schema", return_value=schema
+        ):
+            entry = MCPView().build_tool_definition(
+                _tool("list", description="A tool", is_auto=False)
+            )
+        assert entry["name"] == "list_thing"
+        assert entry["description"] == "A tool"
+        assert entry["annotations"]["readOnlyHint"] is True
+
+    def test_handle_tools_list_skips_only_the_unschemable_tool(self):
+        good = _tool("list", description="Good", is_auto=False)
+        good.name = "list_good"
+        bad = _tool("list", description="Bad", is_auto=False)
+        bad.name = "list_bad"
+
+        def fake_schema(tool):
+            if tool.name == "list_bad":
+                raise ValueError("boom")
+            return {"inputSchema": {"type": "object", "properties": {}, "required": []}}
+
+        with patch(
+            "djangorestframework_mcp.views.generate_tool_schema",
+            side_effect=fake_schema,
+        ):
+            with patch("djangorestframework_mcp.views.registry") as mock_registry:
+                mock_registry.get_all_tools.return_value = [good, bad]
+                result = MCPView().handle_tools_list()
+
+        assert {t["name"] for t in result["tools"]} == {"list_good"}
 
 
 class TestMCPView(unittest.TestCase):

@@ -1,10 +1,12 @@
 """MCP HTTP endpoint views."""
 
+import inspect
 import json
+import logging
 from http import HTTPStatus
 from typing import Any, Dict, Optional, Type
 
-from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.http import HttpRequest, HttpResponse, JsonResponse, QueryDict
 from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
@@ -12,11 +14,26 @@ from rest_framework import exceptions
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.parsers import JSONParser
 from rest_framework.request import Request
+from rest_framework.viewsets import GenericViewSet
 
 from .registry import registry
 from .schema import generate_tool_schema
 from .settings import mcp_settings
 from .types import MCPTool
+
+logger = logging.getLogger(__name__)
+
+# The HTTP verb each ViewSet action maps to. MCP is RPC, not REST, but the ViewSet's permissions and
+# authentication may be method-aware (SAFE_METHODS, CSRF), so we give the rebuilt request the verb the
+# routed call would have carried.
+ACTION_METHODS = {
+    "list": "GET",
+    "retrieve": "GET",
+    "create": "POST",
+    "update": "PUT",
+    "partial_update": "PATCH",
+    "destroy": "DELETE",
+}
 
 
 @method_decorator(csrf_exempt, name="dispatch")
@@ -103,23 +120,83 @@ class MCPView(View):
     def handle_tools_list(self) -> Dict[str, Any]:
         """Handle tools/list request."""
         tools = []
-
         for tool in registry.get_all_tools():
-            tool_schema = generate_tool_schema(tool)
-
-            tool_dict = {
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": tool_schema["inputSchema"],
-            }
-
-            # Add title if present
-            if tool.title:
-                tool_dict["title"] = tool.title
-
-            tools.append(tool_dict)
-
+            entry = self.build_tool_definition(tool)
+            if entry is not None:
+                tools.append(entry)
         return {"tools": tools}
+
+    def build_tool_definition(self, tool: MCPTool) -> Optional[Dict[str, Any]]:
+        """Build the tools/list entry for ``tool``, or ``None`` if it can't be advertised.
+
+        A ViewSet whose serializer drf-mcp can't introspect (custom fields, ``serializer_class = None``,
+        ...) raises during schema generation; rather than break ``tools/list`` for the whole server we
+        log and skip that one tool so every other tool is still discoverable. Subclasses can call this
+        and then extend the returned entry (e.g. add extra inputs to ``inputSchema``).
+        """
+        try:
+            tool_schema = generate_tool_schema(tool)
+        except Exception as exc:  # noqa: BLE001 - one bad serializer must not break discovery
+            logger.warning(
+                "Skipping MCP tool %s: input schema generation failed (%s)",
+                tool.name,
+                exc,
+            )
+            return None
+
+        entry: Dict[str, Any] = {
+            "name": tool.name,
+            "description": self.get_tool_description(tool),
+            "inputSchema": tool_schema["inputSchema"],
+        }
+        if tool.title:
+            entry["title"] = tool.title
+        annotations = self.get_tool_annotations(tool)
+        if annotations:
+            entry["annotations"] = annotations
+        return entry
+
+    def get_tool_description(self, tool: MCPTool) -> Optional[str]:
+        """The description advertised for ``tool`` in tools/list.
+
+        Prefers an explicit ``@mcp_tool(description=...)``. Otherwise, when the description was
+        auto-generated, falls back to the ViewSet's docstring summary (its first paragraph) if it has
+        one -- which reads far better for an LLM than the robotic ``"<Action> <basename>"`` default, and
+        lets two ViewSets over the same model be told apart. Falls back to the generated default when
+        there is no docstring.
+        """
+        if getattr(tool, "description_is_auto", False):
+            # The ViewSet's *own* docstring only -- never one inherited from a DRF mixin (e.g.
+            # ListModelMixin's "List a queryset."), which would be misleading.
+            doc = tool.viewset_class.__dict__.get("__doc__")
+            if doc:
+                doc = inspect.cleandoc(doc)
+                summary = " ".join(doc.split("\n\n", 1)[0].split())
+                if summary:
+                    return summary
+        return tool.description
+
+    def get_tool_annotations(self, tool: MCPTool) -> Dict[str, Any]:
+        """MCP tool ``annotations`` hints derived from the action.
+
+        ``readOnlyHint`` lets clients group tools (e.g. Claude's connector UI only buckets a tool under
+        "Read-only tools" when it is present and true). Write actions additionally advertise
+        ``destructiveHint`` / ``idempotentHint``. ``openWorldHint`` is ``False``: a ViewSet tool operates
+        on the application's own data, not an open-ended external system.
+        """
+        read_only = tool.action in ("list", "retrieve")
+        annotations: Dict[str, Any] = {
+            "readOnlyHint": read_only,
+            "openWorldHint": False,
+        }
+        if not read_only:
+            annotations["destructiveHint"] = tool.action == "destroy"
+            annotations["idempotentHint"] = tool.action in (
+                "update",
+                "partial_update",
+                "destroy",
+            )
+        return annotations
 
     def handle_tools_call(
         self, params: Dict[str, Any], original_request: HttpRequest
@@ -184,8 +261,9 @@ class MCPView(View):
         )
 
         try:
-            # Trigger authentication by accessing the user property
-            # This will run through all authenticators and set user/auth
+            # Trigger authentication by accessing the user property. This runs through all
+            # authenticators and (via DRF's Request.user setter) also sets user/auth on the underlying
+            # request, so has_mcp_permission below can rely on request.user / request.auth.
             _ = drf_request.user
 
             # Check permissions
@@ -261,35 +339,31 @@ class MCPView(View):
             }
         )
 
-    def execute_tool(
-        self, tool: MCPTool, params: Dict[str, Any], original_request: HttpRequest
-    ) -> Any:
-        """Execute a tool using the structured kwargs+body parameter format.
+    def build_tool_request(
+        self,
+        tool: MCPTool,
+        original_request: HttpRequest,
+        *,
+        body: Optional[Dict[str, Any]] = None,
+        query: Optional[Dict[str, Any]] = None,
+    ) -> Request:
+        """Build a DRF ``Request`` equivalent to the routed API call for ``tool``.
 
-        This method manually calls DRF lifecycle methods to ensure proper
-        request handling while avoiding HTTP method semantics since MCP is RPC-based.
+        Carries over the original request's META and the user/auth authenticated at the MCP endpoint,
+        sets the HTTP method implied by the action, installs ``body`` as the JSON payload, and applies an
+        optional list ``query`` as a real query string. Used by :meth:`execute_tool`, and available to
+        subclasses that need to rebuild a request per tool (e.g. probing permissions during discovery).
         """
-        viewset_class = tool.viewset_class
-        action = tool.action
-
-        # Create ViewSet instance
-        viewset = viewset_class()
-
-        # Get MCP settings to check for bypass options
         bypass_viewset_auth = mcp_settings.BYPASS_VIEWSET_AUTHENTICATION
-        bypass_viewset_permissions = mcp_settings.BYPASS_VIEWSET_PERMISSIONS
-
-        # Extract structured parameters
-        method_kwargs = params.get("kwargs", {})
-        body_data = params.get("body", {})
 
         # Create a new HttpRequest that represents the equivalent API call
-        body_bytes = json.dumps(body_data).encode("utf-8") if body_data else b"{}"
+        body_bytes = json.dumps(body).encode("utf-8") if body else b"{}"
         request = HttpRequest()
 
-        # Carry over META, authenticated user info from original request
+        # Carry over META and authenticated user info from the original request
         for key, value in original_request.META.items():
             request.META[key] = value
+        request.method = ACTION_METHODS.get(tool.action, "GET")
         if hasattr(original_request, "user"):
             request.user = original_request.user
         if hasattr(original_request, "auth"):
@@ -299,61 +373,148 @@ class MCPView(View):
         request.META["HTTP_CONTENT_TYPE"] = "application/json"
         request.META["HTTP_CONTENT_LENGTH"] = str(len(body_bytes))
         request._body = body_bytes
-        request._read_started = True  # We aren't creating a proper stream. Marking it as started tells the parser it does not need to read it as a stream.
+        # We aren't creating a proper stream. Marking it as started tells the parser it does not need to
+        # read it as a stream.
+        request._read_started = True
 
-        # Replicate what `rest_framework.views.APIView.dispatch` does during a normal API Request, but specialized for MCP.
+        if query:
+            self._apply_query_params(request, query)
 
-        # Step 1: Initialize request - converts HttpRequest to DRF Request
-        # Based on the implementation of `rest_framework.views.APIView.initialize_request`
-        # but without parsers or content negotiation since those don't apply to MCP Request:
-
-        authenticators = [] if bypass_viewset_auth else viewset.get_authenticators()
+        # Based on `rest_framework.views.APIView.initialize_request`, but without content negotiation
+        # since that doesn't apply to an MCP request.
+        authenticators = (
+            [] if bypass_viewset_auth else tool.viewset_class().get_authenticators()
+        )
         drf_request = Request(
             request,
             parsers=[JSONParser()],  # MCP always uses JSON
             authenticators=authenticators,
         )
 
-        # If bypassing ViewSet auth, carry over auth info in case where user was authenticated at MCP endpoint
+        # If bypassing ViewSet auth, carry over the user authenticated at the MCP endpoint.
         if bypass_viewset_auth:
             if hasattr(request, "user"):
                 drf_request.user = request.user
             if hasattr(request, "auth"):
                 drf_request.auth = request.auth
 
-        # From `rest_framework.viewsets.ViewSetMixin.initialize_request`:
-        viewset.action = action
-
         # Mark request as coming from MCP
         drf_request.is_mcp_request = True
+        return drf_request
 
-        # Step 2: Set up ViewSet context
+    def build_viewset(
+        self,
+        tool: MCPTool,
+        drf_request: Request,
+        *,
+        method_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> GenericViewSet:
+        """Instantiate and initialise the ViewSet for ``tool``, as DRF's dispatch would for this action."""
+        viewset = tool.viewset_class()
+        # From `rest_framework.viewsets.ViewSetMixin.initialize_request` / APIView.dispatch:
+        viewset.action = tool.action
         viewset.args = ()
-        viewset.kwargs = method_kwargs.copy()
+        viewset.kwargs = dict(method_kwargs or {})
         viewset.headers = {}  # In the future, this will be passed in via a headers param.
         viewset.request = drf_request
         viewset.format_kwarg = None
+        return viewset
 
-        # Step 3: Perform authentication, permissions, and throttling based on settings
+    @staticmethod
+    def _apply_query_params(request: HttpRequest, query: Dict[str, Any]) -> None:
+        """Write an MCP ``query`` object onto ``request`` as a real query string.
+
+        List-valued entries (multi-choice filters) become repeated params so django-filter reads them as
+        a list, matching how the same call arrives over HTTP. ``None`` values are dropped.
+        """
+        query_dict = QueryDict(mutable=True)
+        for key, value in query.items():
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple)):
+                query_dict.setlist(key, [str(item) for item in value])
+            elif isinstance(value, bool):
+                query_dict[key] = "true" if value else "false"
+            else:
+                query_dict[key] = str(value)
+        request.GET = query_dict  # type: ignore[assignment]
+        request.META["QUERY_STRING"] = query_dict.urlencode()
+
+    def prepare_tool_request(
+        self,
+        request: Request,
+        original_request: HttpRequest,
+        tool: MCPTool,
+        params: Dict[str, Any],
+    ) -> None:
+        """Hook: attach extra context to the per-tool ``request`` before it is authorised and run.
+
+        Called by :meth:`execute_tool` after the request is built but before the ViewSet's permission
+        classes run, so overrides can attach state that routing/middleware would normally provide (e.g.
+        multi-tenant context resolved from ``params``). Raising here aborts the call (reported as a tool
+        error). Default: no-op.
+        """
+        return None
+
+    def on_viewset_permission_denied(
+        self, tool: MCPTool, exc: exceptions.PermissionDenied, request: Request
+    ) -> None:
+        """Hook: called when the ViewSet's permission classes deny a ``tools/call``.
+
+        Default re-raises the ``PermissionDenied`` so it surfaces as an HTTP 403 (or a 200 body under
+        ``RETURN_200_FOR_ERRORS``), consistent with the MCP endpoint's own permission handling. Override
+        to turn a per-call authorization failure into a tool-level error instead (raise a plain
+        exception, which :meth:`handle_tools_call` reports with ``isError``) -- useful when a 403 would
+        wrongly prompt an MCP client to re-authenticate the entire connection.
+        """
+        raise exc
+
+    def execute_tool(
+        self, tool: MCPTool, params: Dict[str, Any], original_request: HttpRequest
+    ) -> Any:
+        """Execute a tool using the structured kwargs+body parameter format.
+
+        This manually replicates the parts of `rest_framework.views.APIView.dispatch` that apply to an
+        MCP (RPC-based) call: build an equivalent DRF request, authenticate/authorize it per the
+        settings, then call the action method directly.
+        """
+        bypass_viewset_auth = mcp_settings.BYPASS_VIEWSET_AUTHENTICATION
+        bypass_viewset_permissions = mcp_settings.BYPASS_VIEWSET_PERMISSIONS
+
+        # Extract structured parameters
+        method_kwargs = dict(params.get("kwargs", {}))
+        body = params.get("body", {})
+        # Filtering/ordering/pagination via `query` is only meaningful on the list action.
+        query = params.get("query") if tool.action == "list" else None
+
+        drf_request = self.build_tool_request(
+            tool, original_request, body=body, query=query
+        )
+        # Hook for subclasses to attach per-call context (e.g. tenancy) before authorization runs.
+        self.prepare_tool_request(drf_request, original_request, tool, params)
+        viewset = self.build_viewset(tool, drf_request, method_kwargs=method_kwargs)
+
+        if not hasattr(viewset, tool.action):
+            raise ValueError(f"ViewSet does not support action: {tool.action}")
+
+        # Perform authentication and permissions based on settings, authorizing the action the same way
+        # the web app would.
         try:
             if not bypass_viewset_auth:
                 viewset.perform_authentication(drf_request)
-
             if not bypass_viewset_permissions:
                 viewset.check_permissions(drf_request)
-        except (
-            exceptions.AuthenticationFailed,
-            exceptions.NotAuthenticated,
-            exceptions.PermissionDenied,
-        ) as exc:
-            # Set WWW-Authenticate header for auth-related permission errors
-            if isinstance(
-                exc, (exceptions.AuthenticationFailed, exceptions.NotAuthenticated)
-            ):
-                authenticators = viewset.get_authenticators()
-                if authenticators:
-                    exc.auth_header = authenticators[0].authenticate_header(drf_request)  # type: ignore[union-attr]
+        except (exceptions.AuthenticationFailed, exceptions.NotAuthenticated) as exc:
+            # Set WWW-Authenticate header for auth-related errors
+            authenticators = viewset.get_authenticators()
+            if authenticators:
+                exc.auth_header = authenticators[0].authenticate_header(drf_request)  # type: ignore[union-attr]
             raise
+        except exceptions.PermissionDenied as exc:
+            # Authenticated but not authorized for this action. By default re-raised (HTTP 403);
+            # subclasses may convert it into a tool-level error via on_viewset_permission_denied.
+            self.on_viewset_permission_denied(tool, exc, drf_request)
+            raise  # fail closed if a hook neither raised nor returned
 
         # Check throttles
         viewset.check_throttles(drf_request)
@@ -364,14 +525,14 @@ class MCPView(View):
         )
         drf_request.version, drf_request.versioning_scheme = version, scheme
 
-        # Step 4: Get and call the action method directly
-        if not hasattr(viewset, action):
-            raise ValueError(f"ViewSet does not support action: {action}")
-
-        action_method = getattr(viewset, action)
+        # Get and call the action method directly
+        action_method = getattr(viewset, tool.action)
         response = action_method(drf_request, **method_kwargs)
+        return self._handle_tool_response(response)
 
-        # Handle DRF Response objects
+    @staticmethod
+    def _handle_tool_response(response: Any) -> Any:
+        """Convert a DRF Response into the tool result, raising on error responses."""
         if hasattr(response, "data"):
             # Handle DRF error responses
             if response.status_code >= HTTPStatus.BAD_REQUEST.value:
@@ -380,8 +541,7 @@ class MCPView(View):
             # Handle successful responses
             if response.data is not None:
                 return response.data
-            else:
-                # For responses like 204 No Content (destroy), return a success message
-                return {"message": "Operation completed successfully"}
+            # For responses like 204 No Content (destroy), return a success message
+            return {"message": "Operation completed successfully"}
 
         return response

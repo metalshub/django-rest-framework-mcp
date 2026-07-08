@@ -1,6 +1,9 @@
 from django.utils import timezone
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import viewsets
 from rest_framework.decorators import action
+from rest_framework.filters import OrderingFilter
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 
 from blog.models import Customer, Order, Post
@@ -15,12 +18,33 @@ from blog.serializers import (
 from djangorestframework_mcp.decorators import mcp_tool, mcp_viewset
 
 
+class PostPagination(PageNumberPagination):
+    """Small page size so the demo's list tool paginates with only a few posts."""
+
+    page_size = 5
+    page_size_query_param = "page_size"
+
+
 # DEMO: Tools are created for all CRUD actions on ModelViewSet
 @mcp_viewset()
 class PostViewSet(viewsets.ModelViewSet):
+    """Manage blog posts -- create, read, update, and delete.
+
+    DEMO: This first paragraph becomes the `list_posts` tool description (instead of the generated
+    "List posts" default). The list tool also exposes filtering, ordering and pagination via an
+    optional `query` input, mirroring the query string the web API accepts.
+    """
+
     queryset = Post.objects.all()
     # DEMO: permissions set on the ViewSet will be applied to both API and MCP requests
     permission_classes = [IsAuthorOrReadOnly]
+    # DEMO: filtering/ordering/pagination are advertised on the `list` tool as an optional `query`
+    # input, mirroring the query string the same endpoint accepts over HTTP.
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_fields = ["category", "author"]
+    ordering_fields = ["created_at", "updated_at", "title"]
+    ordering = ["-created_at"]
+    pagination_class = PostPagination
 
     def get_serializer_class(self):
         if self.action == "bulk_create":

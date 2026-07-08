@@ -20,6 +20,10 @@ class MCPTool:
     action: str
     title: Optional[str] = None
     description: Optional[str] = None
+    # True when `description` was auto-generated (e.g. "List customer") rather than supplied via
+    # @mcp_tool(description=...). Lets the MCP view prefer the ViewSet docstring over the robotic
+    # default without ever overriding an explicit description. See MCPView.get_tool_description.
+    description_is_auto: bool = False
 
     def __post_init__(self):
         """Validate the tool configuration after initialization."""
