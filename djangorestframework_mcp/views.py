@@ -494,6 +494,15 @@ class MCPView(View):
         self.prepare_tool_request(drf_request, original_request, tool, params)
         viewset = self.build_viewset(tool, drf_request, method_kwargs=method_kwargs)
 
+        # The `query` object is the list tool's filtering/ordering interface. When it is omitted, don't
+        # run the ViewSet's filter backends at all -- return the default (paginated) queryset. This
+        # mirrors "the caller didn't ask to filter" and avoids surprising results from filtersets that
+        # filter by default, require a field, or treat empty input as "match nothing". Pass a `query` to
+        # opt into filtering/ordering. (Pagination is applied by the action itself, not a filter backend,
+        # so it still works either way.)
+        if tool.action == "list" and not query:
+            viewset.filter_backends = []
+
         if not hasattr(viewset, tool.action):
             raise ValueError(f"ViewSet does not support action: {tool.action}")
 

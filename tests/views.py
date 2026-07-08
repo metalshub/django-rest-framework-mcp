@@ -165,6 +165,35 @@ class PlainCustomerViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
     serializer_class = CustomerSerializer
 
 
+class DefaultActiveFilterSet(django_filters.FilterSet):
+    """Defaults ``is_active=True`` when unset, so an unfiltered call filters out inactive rows.
+
+    Mirrors real-world filtersets that inject a default in ``__init__`` -- used to prove that omitting
+    the ``query`` skips the filter backends entirely rather than running them with their defaults.
+    """
+
+    is_active = django_filters.BooleanFilter()
+
+    class Meta:
+        model = Customer
+        fields = ["is_active"]
+
+    def __init__(self, data=None, *args, **kwargs):
+        data = (data or {}).copy()
+        data.setdefault("is_active", "true")
+        super().__init__(data, *args, **kwargs)
+
+
+class DefaultFilteringCustomerViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
+    """Customers whose FilterSet defaults to is_active=True."""
+
+    queryset = Customer.objects.all().order_by("id")
+    serializer_class = CustomerSerializer
+    filter_backends = [django_filters.DjangoFilterBackend]
+    filterset_class = DefaultActiveFilterSet
+    pagination_class = SmallPagePagination
+
+
 class EchoViewSet(viewsets.GenericViewSet):
     """Echoes back context attached to the request by an MCPView hook."""
 

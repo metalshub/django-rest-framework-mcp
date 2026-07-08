@@ -459,7 +459,7 @@ Notes:
 - **Ordering** is advertised only when `OrderingFilter` is in `filter_backends` and `ordering_fields` is a concrete list (not `"__all__"`). Each field is offered in ascending and `-`-prefixed descending form.
 - **Filters** are advertised only when `DjangoFilterBackend` is active and the ViewSet declares a `filterset_class` or `filterset_fields`. `django-filter` is an optional dependency — if it isn't installed, filter fields simply aren't advertised (ordering and pagination still are).
 - **Pagination** adds `page` / `page_size` whenever the ViewSet has a `pagination_class`.
-- Without a `query`, the ViewSet's backends still run with their defaults (first page, default ordering) — identical to a `GET` with no query string.
+- The `query` object *is* the filtering/ordering interface: when it is omitted, the filter backends are **not** applied and the ViewSet's default (still paginated) queryset is returned. This avoids surprising results from filtersets that filter by default, require a field, or treat empty input as "match nothing". Pass a `query` to opt into filtering/ordering.
 
 ### Tool Descriptions and Annotations
 

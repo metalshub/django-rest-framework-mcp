@@ -32,6 +32,7 @@ from .views import (
     AuthenticatedViewSet,
     CustomAuthViewSet,
     CustomPermissionViewSet,
+    DefaultFilteringCustomerViewSet,
     EchoViewSet,
     FilterableCustomerViewSet,
     MultipleAuthViewSet,
@@ -2908,14 +2909,56 @@ class ListQueryExecutionTests(TestCase):
         self.assertEqual(len(self._results(result)), 2)
         self.assertEqual(result["structuredContent"]["count"], 5)
 
-    def test_no_query_runs_backends_with_defaults(self):
+    def test_no_query_returns_default_unfiltered_list(self):
         CustomerFactory.create_batch(3)
 
         result = self.client.call_tool("list_filterablecustomer")
 
         self.assertFalse(result.get("isError"), result)
-        # Backends still run without a query: full (unfiltered) count, default first page.
+        # No query -> filter backends are not applied; the default (paginated) queryset is returned.
         self.assertEqual(result["structuredContent"]["count"], 3)
+
+
+@override_settings(ROOT_URLCONF="tests.urls")
+class ListQueryBackendSkippingTests(TestCase):
+    """Omitting `query` skips the filter backends entirely, even when the FilterSet has a default."""
+
+    def setUp(self):
+        registry.clear()
+        registry.register_viewset(
+            DefaultFilteringCustomerViewSet, base_name="defaultfilter"
+        )
+        self.client = MCPClient()
+
+    def tearDown(self):
+        registry.clear()
+
+    def _results(self, result):
+        return result["structuredContent"]["results"]
+
+    def test_no_query_bypasses_default_filter(self):
+        CustomerFactory(is_active=True)
+        CustomerFactory(is_active=False)
+
+        result = self.client.call_tool("list_defaultfilter")
+
+        self.assertFalse(result.get("isError"), result)
+        # The FilterSet would default to is_active=True, but with no query the backend is not run,
+        # so the inactive customer is still returned.
+        self.assertEqual(result["structuredContent"]["count"], 2)
+
+    def test_query_applies_the_filterset(self):
+        active = CustomerFactory(is_active=True)
+        inactive = CustomerFactory(is_active=False)
+
+        result = self.client.call_tool(
+            "list_defaultfilter", {"query": {"is_active": True}}
+        )
+
+        self.assertFalse(result.get("isError"), result)
+        ids = {row["id"] for row in self._results(result)}
+        self.assertIn(active.id, ids)
+        self.assertNotIn(inactive.id, ids)
 
 
 @override_settings(ROOT_URLCONF="tests.urls")
